@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+type EvidenceRecord = {
+  id: string;
+  timestamp: string;
+  kind: string;
+  label: string;
+  detail: string;
+  source: string;
+  meta?: Record<string, unknown>;
+};
+
 type Finding = {
   id: string;
   severity: string;
@@ -8,6 +18,7 @@ type Finding = {
   evidence: string;
   description: string;
 };
+
 type Event = {
   id: string;
   kind: string;
@@ -16,52 +27,95 @@ type Event = {
   time: string;
 };
 
-const findings: Finding[] = [
-  {
-    id: "FND-001",
-    severity: "Medium",
-    title: "Content-Security-Policy header is missing",
-    source: "Passive",
-    evidence: "EV-004",
-    description:
-      "The document response did not include a Content-Security-Policy header. This is an observed configuration weakness, not proof of exploitability.",
-  },
-  {
-    id: "FND-002",
-    severity: "Low",
-    title: "Session cookie lacks SameSite attribute",
-    source: "Passive",
-    evidence: "EV-005",
-    description:
-      "A cookie was observed without an explicit SameSite attribute. Review the cookie configuration and choose the strictest compatible behavior.",
-  },
-  {
-    id: "FND-003",
-    severity: "Info",
-    title: "Console reported a CSP violation",
-    source: "Browser",
-    evidence: "EV-006",
-    description:
-      "The browser recorded a policy message. Inspect the cited resource before deciding whether the policy needs adjustment.",
-  },
-];
+function generateFindingId() {
+  return "FND-" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substr(2, 3).toUpperCase();
+}
 
-const initialEvents: Event[] = [
-  {
-    id: "EV-001",
-    kind: "NAV",
-    label: "Evidence capture ready",
-    detail: "Network events will appear here while recording",
-    time: "09:41:03",
-  },
-  {
-    id: "EV-002",
-    kind: "SYS",
-    label: "Passive checks loaded",
-    detail: "6 safe checks are waiting for browser evidence",
-    time: "09:41:04",
-  },
-];
+function evidenceToEvent(record: EvidenceRecord): Event {
+  return {
+    id: record.id,
+    kind: record.kind,
+    label: record.label,
+    detail: record.detail,
+    time: new Date(record.timestamp).toLocaleTimeString([], { hour12: false }),
+  };
+}
+
+function analyzeEvidenceForFindings(evidence: EvidenceRecord[]): Finding[] {
+  const findings: Finding[] = [];
+  const responses = evidence.filter((e) => e.kind === "RES" || e.kind === "RES_DONE");
+  const cookies = new Map<string, { evidenceId: string; sameSite: string; secure: boolean }>();
+  const cspHeader = responses.find((r) => {
+    const headers = r.meta?.headers as Record<string, string[]> | undefined;
+    return headers?.["content-security-policy"] || headers?.["content-security-policy-report-only"];
+  });
+  const hasCsp = !!cspHeader;
+
+  responses.forEach((r) => {
+    const headers = r.meta?.headers as Record<string, string[]> | undefined;
+    if (headers?.["set-cookie"]) {
+      headers["set-cookie"].forEach((cookieStr) => {
+        const parts = cookieStr.split(";").map((p) => p.trim());
+        const nameValue = parts[0].split("=");
+        const name = nameValue[0];
+        const attrs = parts.slice(1).map((p) => p.toLowerCase());
+        cookies.set(name, {
+          evidenceId: r.id,
+          sameSite: attrs.find((a) => a.startsWith("samesite=")) || "missing",
+          secure: attrs.includes("secure"),
+        });
+      });
+    }
+  });
+
+  if (!hasCsp) {
+    findings.push({
+      id: generateFindingId(),
+      severity: "Medium",
+      title: "Content-Security-Policy header is missing",
+      source: "Passive",
+      evidence: responses[0]?.id || "N/A",
+      description: "The document response did not include a Content-Security-Policy header. This is an observed configuration weakness, not proof of exploitability.",
+    });
+  }
+
+  cookies.forEach((cookie, name) => {
+    if (cookie.sameSite === "missing") {
+      findings.push({
+        id: generateFindingId(),
+        severity: "Low",
+        title: `Cookie "${name}" lacks SameSite attribute`,
+        source: "Passive",
+        evidence: cookie.evidenceId,
+        description: "A cookie was observed without an explicit SameSite attribute. Review the cookie configuration and choose the strictest compatible behavior.",
+      });
+    }
+    if (!cookie.secure) {
+      findings.push({
+        id: generateFindingId(),
+        severity: "Low",
+        title: `Cookie "${name}" lacks Secure attribute`,
+        source: "Passive",
+        evidence: cookie.evidenceId,
+        description: "A cookie was observed without the Secure attribute. It may be transmitted over non-HTTPS connections.",
+      });
+    }
+  });
+
+  const consoleErrors = evidence.filter((e) => e.kind === "CONSOLE" && e.meta?.level === "error");
+  consoleErrors.forEach((e) => {
+    findings.push({
+      id: generateFindingId(),
+      severity: "Info",
+      title: "Console error observed",
+      source: "Browser",
+      evidence: e.id,
+      description: `The browser reported a console error: ${e.detail}. Inspect the cited resource before deciding whether action is needed.`,
+    });
+  });
+
+  return findings;
+}
 
 function App() {
   const [name, setName] = useState("");
@@ -71,7 +125,9 @@ function App() {
   const [recording, setRecording] = useState(false);
   const [selected, setSelected] = useState<Finding | null>(null);
   const [notice, setNotice] = useState("");
-  const [events, setEvents] = useState(initialEvents);
+  const [events, setEvents] = useState<Event[]>([]);
+  const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const browserStage = useRef<HTMLDivElement>(null);
   const origin = useMemo(() => {
     try {
@@ -93,59 +149,58 @@ function App() {
     if (!name.trim()) return setNotice("Add a name for this assessment.");
     if (!validUrl) return setNotice("Enter a complete HTTP or HTTPS URL.");
     if (!consent)
-      return setNotice(
-        "Confirm that you own or are authorized to test this application.",
-      );
+      return setNotice("Confirm that you own or are authorized to test this application.");
     setSession(true);
     setNotice("Session created. The browser is ready.");
-    setEvents([
-      {
-        id: "EV-003",
-        kind: "LOCK",
-        label: "Origin allowlist locked",
-        detail: origin,
-        time: now(),
-      },
-      ...initialEvents,
-    ]);
+    setEvents([]);
+    setEvidence([]);
+    setFindings([]);
     void window.sentinelDesktop?.configureBrowser(origin).then((result) => {
       if (!result.ok)
-        setNotice(
-          result.error ?? "The native browser could not be configured.",
-        );
+        setNotice(result.error ?? "The native browser could not be configured.");
       else void window.sentinelDesktop?.navigateBrowser(url);
     });
   }
-  function toggleRecording() {
+
+  async function toggleRecording() {
     const next = !recording;
-    setRecording(next);
-    setNotice(
-      next
-        ? "Recording browser evidence."
-        : "Recording stopped. Passive checks are ready.",
-    );
-    if (next)
-      setEvents((current) => [
-        {
-          id: "EV-004",
-          kind: "REC",
-          label: "Browser recording started",
-          detail: origin,
-          time: now(),
-        },
-        ...current,
-      ]);
+    if (next) {
+      const result = await window.sentinelDesktop?.startRecording();
+      if (result?.ok) {
+        setRecording(true);
+        setNotice("Recording browser evidence.");
+      } else {
+        setNotice(result?.error ?? "Failed to start recording.");
+      }
+    } else {
+      const result = await window.sentinelDesktop?.stopRecording();
+      if (result?.ok) {
+        setRecording(false);
+        setNotice(`Recording stopped. ${result.count} events captured.`);
+      } else {
+        setNotice(result?.error ?? "Failed to stop recording.");
+      }
+    }
   }
+
+  async function loadEvidence() {
+    const result = await window.sentinelDesktop?.getEvidence();
+    if (result?.ok) {
+      const records = result.evidence as EvidenceRecord[];
+      setEvidence(records);
+      setEvents(records.map(evidenceToEvent));
+      setFindings(analyzeEvidenceForFindings(records));
+    }
+  }
+
   function exportSession() {
     const data = {
       session: { name, origin, exportedAt: new Date().toISOString() },
-      evidence: events,
+      evidence: evidence.map(({ meta: _, ...e }) => e),
       findings: findings.map(({ description: _, ...finding }) => finding),
     };
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(
-      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
-    );
+    link.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
     link.download = "sentinel-session.json";
     link.click();
     URL.revokeObjectURL(link.href);
@@ -166,14 +221,29 @@ function App() {
     };
     updateBounds();
     window.addEventListener("resize", updateBounds);
-    const cleanup = window.sentinelDesktop.onBrowserNavigated(
-      ({ url: navigatedUrl }) =>
-        setNotice(`Browser navigated to ${navigatedUrl}`),
-    );
+    const cleanupNav = window.sentinelDesktop.onBrowserNavigated(({ url: navigatedUrl }) => setNotice(`Browser navigated to ${navigatedUrl}`));
+    const cleanupEvidence = window.sentinelDesktop.onEvidence((record) => {
+      setEvidence((prev) => [...prev, record]);
+      setEvents((prev) => [evidenceToEvent(record), ...prev]);
+      setFindings(analyzeEvidenceForFindings([...evidence, record]));
+    });
+    const cleanupCleared = window.sentinelDesktop.onEvidenceCleared(() => {
+      setEvidence([]);
+      setEvents([]);
+      setFindings([]);
+    });
     return () => {
       window.removeEventListener("resize", updateBounds);
-      cleanup();
+      cleanupNav();
+      cleanupEvidence();
+      cleanupCleared();
     };
+  }, [session]);
+
+  useEffect(() => {
+    if (session && window.sentinelDesktop) {
+      loadEvidence();
+    }
   }, [session]);
 
   if (!session)
@@ -184,54 +254,32 @@ function App() {
           <p className="eyebrow">LOCAL APPLICATION SECURITY LAB</p>
           <h1>Start an evidence-first session.</h1>
           <p className="intro">
-            Sentinel observes an application you control, records what the
-            browser sees, and highlights safe configuration checks.
+            Sentinel observes an application you control, records what the browser sees, and highlights safe configuration checks.
           </p>
           <div className="local-status">
-            <i /> Local workspace ready{" "}
-            <span>Ollama is optional in this milestone</span>
+            <i /> Local workspace ready <span>Ollama is optional in this milestone</span>
           </div>
           <label>
             Assessment name
-            <input
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="e.g. Checkout review"
-            />
+            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Checkout review" />
           </label>
           <label>
             Authorized base URL
-            <input
-              className="mono"
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-              placeholder="https://app.example.test"
-            />
+            <input className="mono" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://app.example.test" />
           </label>
           <div className="allowlist">
             <b>LOCKED ORIGIN</b>
             <span>{origin || "Enter a URL to lock one origin"}</span>
           </div>
           <label className="consent">
-            <input
-              type="checkbox"
-              checked={consent}
-              onChange={(event) => setConsent(event.target.checked)}
-            />{" "}
+            <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
             I own this application or have explicit permission to test it.
           </label>
-          <button
-            className="primary full"
-            disabled={!validUrl || !name.trim() || !consent}
-            onClick={createSession}
-          >
+          <button className="primary full" disabled={!validUrl || !name.trim() || !consent} onClick={createSession}>
             Create session <b>→</b>
           </button>
           {notice && <p className="notice">{notice}</p>}
-          <p className="fine">
-            No payloads. No brute force. No navigation outside the approved
-            origin.
-          </p>
+          <p className="fine">No payloads. No brute force. No navigation outside the approved origin.</p>
         </section>
       </main>
     );
@@ -248,13 +296,10 @@ function App() {
           ["↗", "Reports"],
           ["⚙", "Settings"],
         ].map(([icon, label], index) => (
-          <button
-            className={index === 0 ? "rail-item active" : "rail-item"}
-            key={label}
-          >
+          <button className={index === 0 ? "rail-item active" : "rail-item"} key={label}>
             <span>{icon}</span>
             <small>{label}</small>
-            {label === "Findings" && <b>3</b>}
+            {label === "Findings" && <b>{findings.length}</b>}
           </button>
         ))}
         <div className="rail-local">
@@ -280,12 +325,8 @@ function App() {
         <section className="analysis">
           <div className="heading">
             <div>
-              <p className="eyebrow">
-                {recording ? "LIVE CAPTURE" : "ASSESSMENT OVERVIEW"}
-              </p>
-              <h3>
-                {recording ? "Recording browser activity" : "Session overview"}
-              </h3>
+              <p className="eyebrow">{recording ? "LIVE CAPTURE" : "ASSESSMENT OVERVIEW"}</p>
+              <h3>{recording ? "Recording browser activity" : "Session overview"}</h3>
             </div>
             <span className={recording ? "pill recording" : "pill"}>
               <i />
@@ -295,7 +336,7 @@ function App() {
           <div className="stats">
             <div>
               <small>FINDINGS</small>
-              <strong>3</strong>
+              <strong>{findings.length}</strong>
               <span>passive observations</span>
             </div>
             <div>
@@ -314,29 +355,24 @@ function App() {
               <p className="eyebrow">PASSIVE CHECKS</p>
               <h3>Findings</h3>
             </div>
-            <span className="count">3 total</span>
+            <span className="count">{findings.length} total</span>
           </div>
           <div className="finding-list">
             {findings.map((finding) => (
-              <button
-                className={
-                  selected?.id === finding.id ? "finding selected" : "finding"
-                }
-                key={finding.id}
-                onClick={() => setSelected(finding)}
-              >
-                <em className={`severity ${finding.severity.toLowerCase()}`}>
-                  {finding.severity}
-                </em>
+              <button className={selected?.id === finding.id ? "finding selected" : "finding"} key={finding.id} onClick={() => setSelected(finding)}>
+                <em className={`severity ${finding.severity.toLowerCase()}`}>{finding.severity}</em>
                 <span>
                   <strong>{finding.title}</strong>
-                  <small>
-                    {finding.source} · {finding.evidence}
-                  </small>
+                  <small>{finding.source} · {finding.evidence}</small>
                 </span>
                 <b>›</b>
               </button>
             ))}
+            {findings.length === 0 && !recording && (
+              <div className="empty-findings">
+                <p>No findings yet. Start recording and browse the application to capture evidence.</p>
+              </div>
+            )}
           </div>
         </section>
         <section className="browser">
@@ -349,10 +385,7 @@ function App() {
               <code>{origin}</code>
               <b>Allowlisted</b>
             </div>
-            <button
-              className={recording ? "stop" : "record"}
-              onClick={toggleRecording}
-            >
+            <button className={recording ? "stop" : "record"} onClick={toggleRecording}>
               {recording ? "Stop" : "Record"}
             </button>
           </div>
@@ -362,20 +395,12 @@ function App() {
               <p className="eyebrow">EMBEDDED CHROMIUM PANE</p>
               <h3>{name}</h3>
               <p>
-                The controlled browser surface will appear here. It stays
-                visually separate from Sentinel analysis.
+                The controlled browser surface will appear here. It stays visually separate from Sentinel analysis.
               </p>
               <button className="primary" onClick={toggleRecording}>
                 {recording ? "Stop recording" : "Start recording"}
               </button>
-              <button
-                className="secondary"
-                onClick={() =>
-                  setNotice(
-                    "Inert canary support comes after the evidence foundation.",
-                  )
-                }
-              >
+              <button className="secondary" onClick={() => setNotice("Inert canary support comes after the evidence foundation.")}>
                 Inject inert canary
               </button>
             </div>
@@ -395,7 +420,7 @@ function App() {
               <span>Console</span>
               <span>Screenshots</span>
             </div>
-            {events.slice(0, 3).map((event) => (
+            {events.slice(0, 10).map((event) => (
               <div className="event" key={event.id}>
                 <i>{event.kind.slice(0, 1)}</i>
                 <span>
@@ -406,18 +431,19 @@ function App() {
                 <time>{event.time}</time>
               </div>
             ))}
+            {events.length === 0 && (
+              <div className="empty-events">
+                <p>No events captured yet. Click "Record" and browse the application.</p>
+              </div>
+            )}
           </div>
         </section>
       </main>
       {selected && (
         <aside className="inspector">
-          <button className="close" onClick={() => setSelected(null)}>
-            ×
-          </button>
+          <button className="close" onClick={() => setSelected(null)}>×</button>
           <p className="eyebrow">FINDING DETAIL</p>
-          <em className={`severity ${selected.severity.toLowerCase()}`}>
-            {selected.severity}
-          </em>
+          <em className={`severity ${selected.severity.toLowerCase()}`}>{selected.severity}</em>
           <h3>{selected.title}</h3>
           <div className="tags">
             <span>A05:2021</span>
@@ -430,23 +456,12 @@ function App() {
           </div>
           <div className="detail">
             <p className="eyebrow">EVIDENCE CITATION</p>
-            <button
-              className="evidence-link"
-              onClick={() =>
-                setNotice(`Focused ${selected.evidence} in the timeline.`)
-              }
-            >
-              ↗ {selected.evidence}
-              <small>Open captured event</small>
-            </button>
+            <button className="evidence-link" onClick={() => setNotice(`Focused ${selected.evidence} in the timeline.`)}>↗ {selected.evidence} <small>Open captured event</small></button>
           </div>
           <div className="remediation">
             <p className="eyebrow">REMEDIATION</p>
             <strong>Review the response configuration</strong>
-            <p>
-              Add the appropriate header or cookie attribute, then repeat this
-              authorized session to verify the change.
-            </p>
+            <p>Add the appropriate header or cookie attribute, then repeat this authorized session to verify the change.</p>
           </div>
         </aside>
       )}
@@ -460,7 +475,4 @@ function App() {
   );
 }
 
-function now() {
-  return new Date().toLocaleTimeString([], { hour12: false });
-}
 export default App;
