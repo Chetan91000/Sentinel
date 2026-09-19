@@ -2,6 +2,12 @@
 
 A local, evidence-first browser security assistant for applications you own or are authorized to test.
 
+## Requirements
+
+- **Node.js** (v18 or higher recommended)
+- **npm** (comes with Node.js)
+- Operating System: Windows, macOS, or Linux (Electron compatible)
+
 ## Run
 
 ```powershell
