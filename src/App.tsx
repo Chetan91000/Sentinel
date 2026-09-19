@@ -145,20 +145,39 @@ function App() {
     }
   }, [url]);
 
+  function updateBrowserBounds() {
+    if (!browserStage.current || !window.sentinelDesktop) return;
+    const rect = browserStage.current.getBoundingClientRect();
+    window.sentinelDesktop?.setBrowserBounds({
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    });
+  }
+
   function createSession() {
     if (!name.trim()) return setNotice("Add a name for this assessment.");
     if (!validUrl) return setNotice("Enter a complete HTTP or HTTPS URL.");
     if (!consent)
-      return setNotice("Confirm that you own or are authorized to test this application.");
+      return setNotice("Confirm that you own this application or have explicit permission to test it.");
     setSession(true);
     setNotice("Session created. The browser is ready.");
     setEvents([]);
     setEvidence([]);
     setFindings([]);
     void window.sentinelDesktop?.configureBrowser(origin).then((result) => {
-      if (!result.ok)
+      if (!result.ok) {
         setNotice(result.error ?? "The native browser could not be configured.");
-      else void window.sentinelDesktop?.navigateBrowser(url);
+        return;
+      }
+      // The WebContentsView is now created; send the container bounds so it renders visibly.
+      updateBrowserBounds();
+      void window.sentinelDesktop?.navigateBrowser(url).then((navResult) => {
+        if (!navResult?.ok) setNotice(navResult?.error ?? "Navigation failed.");
+        // Ensure bounds are applied after navigation in case of layout shifts.
+        updateBrowserBounds();
+      });
     });
   }
 
@@ -209,18 +228,8 @@ function App() {
 
   useEffect(() => {
     if (!session || !browserStage.current || !window.sentinelDesktop) return;
-    const updateBounds = () => {
-      if (!browserStage.current) return;
-      const rect = browserStage.current.getBoundingClientRect();
-      window.sentinelDesktop?.setBrowserBounds({
-        x: rect.left,
-        y: rect.top,
-        width: rect.width,
-        height: rect.height,
-      });
-    };
-    updateBounds();
-    window.addEventListener("resize", updateBounds);
+    updateBrowserBounds();
+    window.addEventListener("resize", updateBrowserBounds);
     const cleanupNav = window.sentinelDesktop.onBrowserNavigated(({ url: navigatedUrl }) => setNotice(`Browser navigated to ${navigatedUrl}`));
     const cleanupEvidence = window.sentinelDesktop.onEvidence((record) => {
       setEvidence((prev) => [...prev, record]);
@@ -233,7 +242,7 @@ function App() {
       setFindings([]);
     });
     return () => {
-      window.removeEventListener("resize", updateBounds);
+      window.removeEventListener("resize", updateBrowserBounds);
       cleanupNav();
       cleanupEvidence();
       cleanupCleared();
