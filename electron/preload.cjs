@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('sentinelDesktop', {
-  configureBrowser: (origin) => ipcRenderer.invoke('browser:configure', origin),
+  configureBrowser: (payload) => ipcRenderer.invoke('browser:configure', payload),
   navigateBrowser: (url) => ipcRenderer.invoke('browser:navigate', url),
   setBrowserBounds: (bounds) => ipcRenderer.send('browser:set-bounds', bounds),
   hideBrowser: () => ipcRenderer.send('browser:hide'),
@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('sentinelDesktop', {
   stopRecording: () => ipcRenderer.invoke('recording:stop'),
   getEvidence: () => ipcRenderer.invoke('evidence:get'),
   clearEvidence: () => ipcRenderer.invoke('evidence:clear'),
+  addEvidence: (record) => ipcRenderer.invoke('evidence:add', record),
   onEvidence: (callback) => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('evidence:new', listener)
@@ -24,4 +25,7 @@ contextBridge.exposeInMainWorld('sentinelDesktop', {
     ipcRenderer.on('evidence:cleared', listener)
     return () => ipcRenderer.removeListener('evidence:cleared', listener)
   },
+  injectCanary: (payload) => ipcRenderer.invoke('canary:inject', payload),
+  queryAdvisor: (payload) => ipcRenderer.invoke('advisor:query', payload),
+  checkOllamaStatus: (payload) => ipcRenderer.invoke('ollama:status', payload),
 })
