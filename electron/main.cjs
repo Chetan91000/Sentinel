@@ -176,11 +176,49 @@ function clearEvidence() {
   }
 }
 
+function getDomainFromHost(host) {
+  if (!host) return ''
+  const hostname = host.split(':')[0].toLowerCase()
+  if (['127.0.0.1', 'localhost', '::1', '[::1]'].includes(hostname)) {
+    return 'localhost'
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
+    return hostname
+  }
+  const parts = hostname.split('.')
+  if (parts.length <= 2) return hostname
+  return parts.slice(-2).join('.')
+}
+
 function isAllowed(url) {
   try {
     if (!allowedOrigin) return false
-    const parsed = new URL(url)
-    return parsed.origin === allowedOrigin
+    if (!url || typeof url !== 'string') return false
+    if (url.startsWith('data:') || url.startsWith('about:blank')) return true
+
+    const parsedTarget = new URL(url)
+    const parsedAllowed = new URL(allowedOrigin)
+
+    // Direct origin match
+    if (parsedTarget.origin === allowedOrigin) return true
+
+    // Check loopback equivalence (localhost <-> 127.0.0.1 on matching port)
+    const isTargetLoopback = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(parsedTarget.hostname.toLowerCase())
+    const isAllowedLoopback = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(parsedAllowed.hostname.toLowerCase())
+    if (isTargetLoopback && isAllowedLoopback) {
+      const targetPort = parsedTarget.port || (parsedTarget.protocol === 'https:' ? '443' : '80')
+      const allowedPort = parsedAllowed.port || (parsedAllowed.protocol === 'https:' ? '443' : '80')
+      return targetPort === allowedPort
+    }
+
+    // Check domain family match (e.g. youtube.com <-> www.youtube.com)
+    const targetDomain = getDomainFromHost(parsedTarget.hostname)
+    const allowedDomain = getDomainFromHost(parsedAllowed.hostname)
+    if (targetDomain && targetDomain === allowedDomain) {
+      return true
+    }
+
+    return false
   } catch {
     return false
   }
@@ -188,6 +226,7 @@ function isAllowed(url) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    title: 'Sentinel Desktop',
     width: 1440,
     height: 900,
     minWidth: 1080,
@@ -203,6 +242,12 @@ function createWindow() {
   })
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show()
+    }
+  }, 1200)
+
   mainWindow.on('closed', () => {
     mainWindow = null
     browserView = null
@@ -210,8 +255,14 @@ function createWindow() {
   })
 
   const rendererUrl = !app.isPackaged ? 'http://127.0.0.1:5173' : null
-  if (rendererUrl) mainWindow.loadURL(rendererUrl)
-  else mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  if (rendererUrl) {
+    mainWindow.loadURL(rendererUrl).catch((err) => {
+      console.warn('Could not load dev server, falling back to dist/index.html:', err.message)
+      mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    })
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  }
 }
 
 function attachCdpDebugger() {
@@ -287,15 +338,38 @@ function createBrowserView() {
   const labSession = session.fromPartition('in-memory-lab', { cache: false })
   labSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
   labSession.on('will-download', (event) => event.preventDefault())
+  labSession.on('certificate-error', (event, _webContents, _url, _error, _certificate, callback) => {
+    event.preventDefault()
+    callback(true)
+  })
 
   browserView = new WebContentsView({
     webPreferences: {
       partition: 'in-memory-lab',
+      preload: path.join(__dirname, 'empty-preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   })
+
+  // Set dark background to prevent flashing or solid white box in Sentinel UI
+  try {
+    browserView.setBackgroundColor('#0a0e17')
+  } catch {
+    try {
+      browserView.setBackgroundColor({ r: 10, g: 14, b: 23, a: 255 })
+    } catch {}
+  }
+
+  // Sanitize User-Agent so modern sites do not block or serve blank screens to Electron
+  try {
+    const rawUa = browserView.webContents.getUserAgent()
+    const cleanUa = rawUa.replace(/Electron\/[0-9\.]+\s?/, '')
+    browserView.webContents.setUserAgent(cleanUa)
+  } catch (err) {
+    console.warn('Could not set custom User-Agent:', err)
+  }
 
   mainWindow.contentView.addChildView(browserView)
   browserView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
@@ -303,13 +377,24 @@ function createBrowserView() {
 
   browserView.webContents.on('will-navigate', (event, url) => {
     if (!isAllowed(url)) {
+      console.warn('Blocked out-of-scope navigation to:', url)
       event.preventDefault()
     }
   })
 
   browserView.webContents.on('will-redirect', (event, url) => {
     if (!isAllowed(url)) {
+      console.warn('Blocked out-of-scope redirect to:', url)
       event.preventDefault()
+    } else {
+      // If redirecting within the same domain family or loopback (e.g. apex -> www or http -> https),
+      // update allowedOrigin to ensure subsequent navigations and subresources are permitted
+      try {
+        const redirectedOrigin = new URL(url).origin
+        if (redirectedOrigin !== allowedOrigin) {
+          allowedOrigin = redirectedOrigin
+        }
+      } catch {}
     }
   })
 
@@ -320,8 +405,64 @@ function createBrowserView() {
     }
   })
 
-  // Network interception on isolated labSession
-  const filter = { urls: [`${allowedOrigin}/*`] }
+  browserView.webContents.on('did-navigate-in-page', (_event, url) => {
+    mainWindow?.webContents.send('browser:navigated', { url })
+    if (isRecording) {
+      addEvidence({ kind: 'NAV', label: 'In-Page Navigation', detail: url, source: 'browser' })
+    }
+  })
+
+  browserView.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return
+    if (errorCode === -3) return // Handled / aborted navigation or redirect
+
+    addEvidence({
+      kind: 'ERR',
+      label: 'Page Load Failed',
+      detail: `[${errorCode}] ${errorDescription} - ${validatedURL}`,
+      source: 'browser',
+      meta: { errorCode, errorDescription, url: validatedURL }
+    })
+
+    const errorHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      background: #0a0e17;
+      color: #94a6c0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+      text-align: center;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    h2 { color: #f87171; margin-bottom: 8px; font-size: 18px; }
+    p { font-size: 13px; line-height: 1.6; max-width: 520px; margin: 6px 0; }
+    code { background: rgba(34, 211, 238, 0.12); color: #22d3ee; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; }
+    .btn { margin-top: 18px; background: rgba(34, 211, 238, 0.18); border: 1px solid #22d3ee; color: #22d3ee; padding: 7px 18px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
+    .btn:hover { background: rgba(34, 211, 238, 0.32); }
+  </style>
+</head>
+<body>
+  <h2>Unable to Load Target</h2>
+  <p>Failed to connect to <code>${validatedURL}</code></p>
+  <p style="color: #5c6c88; font-size: 12px;">${errorDescription} (${errorCode})</p>
+  <p style="color: #5c6c88; font-size: 11px;">Make sure your target server is running and accessible.</p>
+  <button class="btn" onclick="window.location.reload()">Retry Connection ↻</button>
+</body>
+</html>`
+    browserView.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(errorHtml)}`).catch(() => {})
+  })
+
+  // Network interception on isolated labSession (all traffic from the isolated browser view)
+  const filter = { urls: ['*://*/*'] }
 
   labSession.webRequest.onBeforeRequest(filter, (details, callback) => {
     if (isRecording) {
@@ -434,13 +575,20 @@ ipcMain.handle('browser:configure', (_event, payload) => {
   }
 })
 
-ipcMain.handle('browser:navigate', (_event, url) => {
+ipcMain.handle('browser:navigate', async (_event, url) => {
   if (!browserView || !isAllowed(url)) {
     return { ok: false, error: 'Navigation blocked: Destination is outside the locked origin allowlist.' }
   }
-  browserView.webContents.loadURL(url)
-  addEvidence({ kind: 'NAV', label: 'Navigation Requested', detail: url, source: 'browser' })
-  return { ok: true }
+  try {
+    addEvidence({ kind: 'NAV', label: 'Navigation Requested', detail: url, source: 'browser' })
+    await browserView.webContents.loadURL(url)
+    return { ok: true }
+  } catch (err) {
+    if (err.message && err.message.includes('ERR_ABORTED')) {
+      return { ok: true }
+    }
+    return { ok: false, error: err.message }
+  }
 })
 
 ipcMain.handle('recording:start', () => {

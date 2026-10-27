@@ -394,27 +394,14 @@ export function SessionView({
               style={{
                 flex: 1,
                 minHeight: "180px",
-                background: "rgba(5, 8, 14, 0.9)",
+                background: "transparent",
                 border: "1px solid var(--sv-glass-brd)",
                 borderTop: "none",
                 borderRadius: "0 0 8px 8px",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                justifyContent: "center",
                 position: "relative",
                 overflow: "hidden",
               }}
-            >
-              <div style={{ textAlign: "center", padding: "16px", color: "var(--sv-text-2)", pointerEvents: "none" }}>
-                <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--sv-text-1)", marginBottom: "4px" }}>
-                  EPHEMERAL CHROMIUM VIEWPORT
-                </div>
-                <div style={{ fontSize: "11px" }}>
-                  Active Electron sandbox rendered at this container's native OS coordinates.
-                </div>
-              </div>
-            </div>
+            />
           </section>
 
           {/* Section 2: Findings Queue */}

@@ -404,6 +404,14 @@ export function App() {
     if (!sessionActive || !browserStage.current || !window.sentinelDesktop) return;
     updateBrowserBounds();
     window.addEventListener("resize", updateBrowserBounds);
+    window.addEventListener("scroll", updateBrowserBounds, true);
+
+    const resizeObserver = new ResizeObserver(() => {
+      updateBrowserBounds();
+    });
+    if (browserStage.current) {
+      resizeObserver.observe(browserStage.current);
+    }
 
     const cleanupNav = window.sentinelDesktop.onBrowserNavigated(({ url: navigatedUrl }) => {
       setNotice(`Browser navigated: ${navigatedUrl}`);
@@ -430,6 +438,8 @@ export function App() {
 
     return () => {
       window.removeEventListener("resize", updateBrowserBounds);
+      window.removeEventListener("scroll", updateBrowserBounds, true);
+      resizeObserver.disconnect();
       cleanupNav();
       cleanupEvidence();
       cleanupCleared();
